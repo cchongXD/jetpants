@@ -1,3 +1,7 @@
+# This is the Jetpants module entrypoint. It loads all base Jetpants files,
+# configuration, and plugins. It then initializes the object model / database
+# topology.
+
 require 'sequel'
 require 'net/ssh'
 require 'yaml'
@@ -17,7 +21,7 @@ module Jetpants
   # Establish default configuration values, and then merge in whatever we find globally
   # in /etc/jetpants.yaml and per-user in ~/.jetpants.yaml
   @config = {
-    'max_concurrency'         =>  40,         # max threads/conns per database
+    'max_concurrency'         =>  20,         # max threads/conns per database
     'standby_slaves_per_pool' =>  2,          # number of standby slaves in every pool
     'mysql_schema'            =>  'test',     # database name
     'mysql_app_user'          =>  'appuser',  # mysql user for application
@@ -32,10 +36,29 @@ module Jetpants
     'plugins'                 =>  {},         # hash of plugin name => arbitrary plugin data (usually a nested hash of settings)
     'ssh_keys'                =>  nil,        # array of SSH key file locations
     'sharded_tables'          =>  [],         # array of name => {sharding_key=>X, chunks=>Y} hashes
+    'compress_with'           =>  false,      # command line to use for compression in large file transfers
+    'decompress_with'         =>  false,      # command line to use for decompression in large file transfers
+    'private_interface'       =>  'bond0',    # network interface corresponding to private IP
   }
-  %w(/etc/jetpants.yaml ~/.jetpants.yml ~/.jetpants.yaml).each do |path|
-    overrides = YAML.load_file(File.expand_path path) rescue {}
-    @config.merge! overrides
+
+  config_paths = ["/etc/jetpants.yaml", "~/.jetpants.yml", "~/.jetpants.yaml"]
+  config_loaded = false
+
+  config_paths.each do |path|
+    begin
+      overrides = YAML.load_file(File.expand_path path)
+      @config.deep_merge! overrides
+      config_loaded = true
+    rescue Errno::ENOENT => error
+    rescue ArgumentError => error
+      puts "YAML parsing error in configuration file #{path} : #{error.message}\n\n"
+      exit
+    end
+  end
+
+  unless config_loaded
+    puts "Could not find any readable configuration files at either /etc/jetpants.yaml or ~/.jetpants.yaml\n\n"
+    exit
   end
   
   class << self

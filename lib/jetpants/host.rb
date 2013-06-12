@@ -38,7 +38,8 @@ module Jetpants
     end
     
     # Returns a Host object for the machine Jetpants is running on.
-    def self.local(interface='bond0')
+    def self.local(interface=false)
+      interface ||= Jetpants.private_interface
       # This technique is adapted from Sergio Rubio Gracia's, described at
       # http://blog.frameos.org/2006/12/09/getting-network-interface-addresses-using-ioctl-pure-ruby-2/
       sock = Socket.new(Socket::AF_INET, Socket::SOCK_DGRAM,0)
@@ -141,7 +142,7 @@ module Jetpants
     # Confirm that something is listening on the given port. The timeout param
     # indicates how long to wait (in seconds) for a process to be listening.
     def confirm_listening_on_port(port, timeout=10)
-      checker_th = Thread.new { ssh_cmd "while [[ `netstat -ln | grep #{port} | wc -l` -lt 1 ]] ; do sleep 1; done" }
+      checker_th = Thread.new { ssh_cmd "while [[ `netstat -ln | grep :#{port} | wc -l` -lt 1 ]] ; do sleep 1; done" }
       raise "Nothing is listening on #{@ip}:#{port} after #{timeout} seconds" unless checker_th.join(timeout)
       true
     end
@@ -156,43 +157,10 @@ module Jetpants
       @available
     end
     
-    ###### ini file manipulation ###############################################
-    
-    # Comments-out lines of an ini file beginning with any of the supplied prefixes
-    def comment_out_ini(file, *prefixes)
-      toggle_ini(file, prefixes, false)
-    end
-    
-    # Un-comments-out lines of an ini file beginning with any of the supplied prefixes
-    # The prefixes should NOT include the # comment-out character -- ie, pass them
-    # the same as you would to DB#comment_out_ini
-    def uncomment_out_ini(file, *prefixes)
-      toggle_ini(file, prefixes, true)
-    end
-    
-    # Comments-out (if enable is true) or un-comments-out (if enable is false) lines of an ini file.
-    def toggle_ini(file, prefixes, enable)
-      prefixes.flatten!
-      commands = []
-      prefixes.each do |setting|
-        if enable
-          search = '^#(\s*%s\s*(?:=.*)?)$' % setting
-          replace = '\1'
-        else
-          search = '^(\s*%s\s*(?:=.*)?)$' % setting
-          replace = '#\1'
-        end
-        commands << "ruby -i -pe 'sub(%r[#{search}], %q[#{replace}])' #{file}"
-      end
-      cmd_line = commands.join '; '
-      ssh_cmd cmd_line
-    end
-    
     
     ###### Directory Copying / Listing / Comparison methods ####################
     
     # Quickly and efficiently recursively copies a directory to one or more target hosts.
-    # Requires that pigz is installed on source (self) and all targets.
     # base_dir::  is base directory to copy from the source (self). Also the default destination base
     #             directory on the targets, if not supplied via next param.
     # targets::   is one of the following:
@@ -225,6 +193,14 @@ module Jetpants
       file_list = filenames.join ' '
       port = (options[:port] || 7000).to_i
       
+      if Jetpants.compress_with || Jetpants.decompress_with
+        comp_bin = Jetpants.compress_with.split(' ')[0]
+        confirm_installed comp_bin
+        output "Using #{comp_bin} for compression"
+      else
+        output "Compression disabled -- no compression method specified in Jetpants config file"
+      end
+      
       # On each destination host, do any initial setup (and optional validation/erasing),
       # and then listen for new files.  If there are multiple destination hosts, all of them
       # except the last will use tee to "chain" the copy along to the next machine.
@@ -233,7 +209,10 @@ module Jetpants
         dir = destinations[t]
         raise "Directory #{t}:#{dir} looks suspicious" if dir.include?('..') || dir.include?('./') || dir == '/' || dir == ''
         
-        t.confirm_installed 'pigz'
+        if Jetpants.compress_with || Jetpants.decompress_with
+          decomp_bin = Jetpants.decompress_with.split(' ')[0]
+          t.confirm_installed decomp_bin
+        end
         t.ssh_cmd "mkdir -p #{dir}"
         
         # Check if contents already exist / non-empty.
@@ -244,8 +223,9 @@ module Jetpants
           dirlist.each {|name, size| raise "File #{name} exists on destination and has nonzero size!" if size.to_i > 0}
         end
         
+        decompression_pipe = Jetpants.decompress_with ? "| #{Jetpants.decompress_with}" : ''
         if i == 0
-          workers << Thread.new { t.ssh_cmd "cd #{dir} && nc -l #{port} | pigz -d | tar xvf -" }
+          workers << Thread.new { t.ssh_cmd "cd #{dir} && nc -l #{port} #{decompression_pipe} | tar xv" }
           t.confirm_listening_on_port port
           t.output "Listening with netcat."
         else
@@ -254,16 +234,16 @@ module Jetpants
           workers << Thread.new { t.ssh_cmd "cd #{dir} && mkfifo #{fifo} && nc #{tt.ip} #{port} <#{fifo} && rm #{fifo}" }
           checker_th = Thread.new { t.ssh_cmd "while [ ! -p #{dir}/#{fifo} ] ; do sleep 1; done" }
           raise "FIFO not found on #{t} after 10 tries" unless checker_th.join(10)
-          workers << Thread.new { t.ssh_cmd "cd #{dir} && nc -l #{port} | tee #{fifo} | pigz -d | tar xvf -" }
+          workers << Thread.new { t.ssh_cmd "cd #{dir} && nc -l #{port} | tee #{fifo} #{decompression_pipe} | tar xv" }
           t.confirm_listening_on_port port
           t.output "Listening with netcat, and chaining to #{tt}."
         end
       end
       
       # Start the copy chain.
-      confirm_installed 'pigz'
       output "Sending files over to #{targets[0]}: #{file_list}"
-      ssh_cmd "cd #{base_dir} && tar vc #{file_list} | pigz | nc #{targets[0].ip} #{port}"
+      compression_pipe = Jetpants.compress_with ? "| #{Jetpants.compress_with}" : ''
+      ssh_cmd "cd #{base_dir} && tar vc #{file_list} #{compression_pipe} | nc #{targets[0].ip} #{port}"
       workers.each {|th| th.join}
       output "File copy complete."
       
@@ -335,16 +315,36 @@ module Jetpants
       end
       total_size
     end
+
+    def mount_stats(mount)
+      mount_stats = {}
+
+      output = ssh_cmd "df -k " + mount + "|tail -1| awk '{print $2\",\"$3\",\"$4}'" 
+      if output
+        output = output.split(',').map{|s| s.to_i}
+
+        mount_stats['total'] = output[0] * 1024
+        mount_stats['used'] = output[1] * 1024
+        mount_stats['available'] = output[2] * 1024
+        return mount_stats
+      else
+        false
+      end
+    end
     
     
     ###### Misc methods ########################################################
     
-    # Performs the given operation ('start', 'stop', 'restart') on the specified
-    # service. Default implementation assumes RedHat/CentOS style /sbin/service.
-    # If you're using a distibution or OS that does not support /sbin/service,
-    # override this method with a plugin.
-    def service(operation, name)
-      ssh_cmd "/sbin/service #{name} #{operation.to_s}"
+    # Performs the given operation (:start, :stop, :restart, :status) for the
+    # specified service (ie "mysql"). Requires that the "service" bin is in
+    # root's PATH.
+    # Please be aware that the output format and exit codes for the service
+    # binary vary between Linux distros! You may find that you need to override
+    # methods that call Host#service with :status operation (such as 
+    # DB#probe_running) in a custom plugin, to parse the output properly on 
+    # your chosen Linux distro.
+    def service(operation, name, options='')
+      ssh_cmd "service #{name} #{operation.to_s} #{options}".rstrip
     end
     
     # Changes the I/O scheduler to name (such as 'deadline', 'noop', 'cfq')
@@ -361,6 +361,19 @@ module Jetpants
       true
     end
     
+    # Checks if there's a process with the given process ID running on this host.
+    # Optionally also checks if matching_string is contained in the process name.
+    # Returns true if so, false if not.
+    # Warning: this implementation assumes Linux-style "ps" command; will not work
+    # on BSD hosts.
+    def pid_running?(pid, matching_string=false)
+      if matching_string
+        ssh_cmd("ps --no-headers -o command #{pid} | grep '#{matching_string}' | wc -l").chomp.to_i > 0
+      else
+        ssh_cmd("ps --no-headers #{pid} | wc -l").chomp.to_i > 0
+      end
+    end
+    
     # Returns number of cores on machine. (reflects virtual cores if hyperthreading
     # enabled, so might be 2x real value in that case.)
     # Not currently used by anything in Jetpants base, but might be useful for plugins
@@ -371,8 +384,20 @@ module Jetpants
       @cores = (count ? count.to_i : 1)
     end
     
+    # Returns the amount of memory on machine, either in bytes (default) or in GB.
+    # Linux-specific.
+    def memory(in_gb=false)
+      line = ssh_cmd 'cat /proc/meminfo | grep MemTotal'
+      matches = line.match /(?<size>\d+)\s+(?<unit>kB|mB|gB|B)/
+      size = matches[:size].to_i
+      multipliers = {kB: 1024, mB: 1024**2, gB: 1024**3, B: 1}
+      size *= multipliers[matches[:unit].to_sym]
+      in_gb ? size / 1024**3 : size
+    end
+    
     # Returns the machine's hostname
     def hostname
+      return 'unknown' unless available?
       @hostname ||= ssh_cmd('hostname').chomp
     end
     

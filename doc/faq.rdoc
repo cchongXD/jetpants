@@ -18,9 +18,9 @@ Doing this more seamlessly would require some amount of parsing of SQL in your a
 
 == Can I use \Jetpants to query some or all shards at once?
 
-Absolutely! You can even use it to implement some simple map/reduce in MySQL:
+Absolutely! You can even use it to implement some simple map/reduce-style distributed computation in MySQL:
 
-   Jetpants.topology.shards.concurrent_map {|s| s.query_return_first_value 'SELECT MAX(id) from foo'}.reduce(0) {|overall_max, val| val > overall_max ? val : overall_max}
+   Jetpants.topology.shards.concurrent_map {|s| s.query_return_first_value 'SELECT MAX(id) from foo'}.reduce(0) {|overall_max, val| [val, overall_max].max}
 
 This example concurrently queries all shards to determine the maximum ID in existence for table foo. This might be useful if, say, you're using Memcached as an ID generation service, and need to determine the previous highest-assigned ID after a restart or failover event.
 
@@ -55,7 +55,7 @@ Rebalancing range-based shards can be accomplished quickly as long as the primar
 
 The main downside to the range-based approach is lack of even distribution of "hot" data. If a small handful of users on a given shard are using a disproportionate amount of resources, there's no way to move _only_ those users to a different shard. For this reason, range-based sharding can work best for "long-tail" sites where the majority of activity is created by the majority of common users.
 
-Some alternatives to the range-based approach include:
+\Jetpants only supports range-based sharding at this time, but for background, here are some alternative approaches:
 
 * <b>Modulus or hash</b>: Apply a function to your sharding key to determine which shard the data lives on.
 
@@ -72,7 +72,11 @@ Some alternatives to the range-based approach include:
 
 \Jetpants clones slaves by stopping replication, shutting down the MySQL daemon, and then copying the raw files to the destination(s). This is the fastest way to get a consistent clone of a data set in MySQL. After the copy operation is complete, we start MySQL back up on the source and destinations, and then make the destination instances start slaving at the appropriate binlog coordinates.
 
-We perform the copy operation using a combination of tar (for archiving), pigz (for fast compression), and nc (for transferring the data over the network). If there are multiple destinations, we create a serial "copy chain" using tee and a fifo.
+We perform the copy operation using a combination of:
+* <tt>tar</tt>, for archiving
+* a compression tool, if specified in your \Jetpants config file; we recommend <tt>qpress</tt> or <tt>pigz</tt>
+* <tt>nc</tt> (netcat), for transferring the data over the network
+* If there are multiple destinations, we create a serial "copy chain" using <tt>tee</tt> and a FIFO.
 
 Please note that we don't encrypt the data in this process, so we assume you are using it on a private LAN or over a VPN tunnel.
 
@@ -115,7 +119,7 @@ For any given operation that requires an asset tracker, there's one of two reaso
 
 * The operation inherently involves generating a new configuration for your application -- for example, setting a shard to read-only or promoting a standby slave to an active slave. These operations are meaningless outside of your application, since MySQL has no notion of "standby slave" or "degraded shard". \Jetpants has a notion of these things, but needs to persist the information somewhere, and it makes more sense to have \Jetpants relay this information to an external hardware management tool rather than maintain a separate (and potentially conflicting) source of truth.
 
-If you have enough servers to be using a sharded architecture, you hopefully already have some sort of hardware management / asset tracker system in place. \Jetpants is designed to be integrated with this system, but since every site runs something different, this requires that you write some custom plugin code to achieve.
+If you have enough servers to be using a sharded architecture, you hopefully already have some sort of hardware management / asset tracker system in place. \Jetpants is designed to be integrated with this system, but since every site runs something different, this requires that you write some custom plugin code to achieve. (Unless you use \Collins for tracking hardware, in which case you can use the bundled jetpants_collins plugin.)
 
 
 == Can I use \Jetpants with PostgreSQL?

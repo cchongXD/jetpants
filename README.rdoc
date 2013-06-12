@@ -8,16 +8,11 @@
 
 == MOTIVATION:
 
-\Jetpants was created by {Tumblr}[http://www.tumblr.com/] to help manage our database infrastructure. It handles automation tasks for our entire database topology, which as of June 2012 consists of approximately:
-* 200 dedicated database servers
-* 12 global (unsharded) functional pools 
-* 45 shard pools
-* 21 terabytes total of unique relational data on masters
-* 60 billion total unique relational rows on masters
+\Jetpants was created by {Tumblr}[http://www.tumblr.com/] to help manage our database infrastructure. It handles automation tasks for our entire database topology, which as of May 2013 consists of over 215 dedicated database servers and nearly 200 billion total distinct relational rows.
 
-One of the primary requirements for \Jetpants was speed. On our hardware, <b>\Jetpants can divide a 750GB, billion-row shard in half in about six hours</b> -- or even faster if you're diving into thirds or fourths. It can also <b>clone slaves at line speed on gigabit ethernet</b>, including to multiple destinations at once, using a novel "chained copy" approach.
+One of the primary requirements for \Jetpants was speed. On our hardware, <b>\Jetpants can divide a 750GB, billion-row shard in half in about six hours</b> -- or even faster if you're diving into thirds or fourths.
 
-For more background on the initial motivations behind \Jetpants, please see {Evan Elias's presentation at Velocity Europe 2011}[https://github.com/tumblr/jetpants/blob/master/doc/VelocityEurope2011Presentation.pdf?raw=true].
+For more background on the motivations behind \Jetpants, please see {Evan Elias's presentation at Percona Live 2013}[https://github.com/tumblr/jetpants/blob/master/doc/PerconaLive2013Presentation.pdf?raw=true].
 
 == COMMAND SUITE FEATURES:
 
@@ -64,6 +59,8 @@ It is highly recommended that you tie \Jetpants into your site's asset tracker /
 
 Other recommended uses of plugins include integration with your site's monitoring system, trending system, query killers, and environment-specific overrides to various core methods.
 
+If you are using \Collins for asset management, \Jetpants now ships with a plugin that offers integration. Please see doc/jetpants_collins.rdoc ({view on GitHub}[https://github.com/tumblr/jetpants/blob/master/doc/jetpants_collins.rdoc]) for usage.
+
 For more information on how to write plugins and use the Jetpants::CallbackHandler system, please see doc/plugins.rdoc ({view on GitHub}[https://github.com/tumblr/jetpants/blob/master/doc/plugins.rdoc])
 
 == FREQUENTLY ASKED QUESTIONS:
@@ -74,12 +71,16 @@ If you have a question that isn't covered here, please feel free to email the au
 
 == CREDITS:
 
-* <b>Evan Elias</b>: Lead developer. Core class implementations, shard split logic, plugin system
-* <b>Dallas Marlow</b>: Master promotion logic, command suite and console structure, MySQL internals expertise
+* <b>Evan Elias</b>: Creator and developer
+* <b>Dallas Marlow</b>: Developer
+* <b>Bob Patterson Jr</b>: Developer
+* <b>Tom Christ</b>: Developer
+
+Special thanks to <b>Tim Ellis</b> for testing and bug reports.
 
 == LICENSE:
 
-Copyright 2012 Tumblr, Inc.
+Copyright 2013 Tumblr, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.

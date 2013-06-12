@@ -22,7 +22,7 @@ module Jetpants
       logfile = option_hash[:log_file]
       pos     = option_hash[:log_pos]
       if !(logfile && pos)
-        raise "Cannot use coordinates of a new master that is receiving updates" if new_master.master && ! new_master.repl_paused
+        raise "Cannot use coordinates of a new master that is receiving updates" if new_master.master && ! new_master.repl_paused?
         logfile, pos = new_master.binlog_coordinates
       end
       
@@ -48,27 +48,67 @@ module Jetpants
     # Pauses replication
     def pause_replication
       raise "This DB object has no master" unless master
-      return if @repl_paused
       output "Pausing replication from #{@master}."
-      output mysql_root_cmd "STOP SLAVE"
-      @repl_paused = true
+      if @repl_paused
+        output "Replication was already paused."
+        repl_binlog_coordinates(true)
+      else
+        output mysql_root_cmd "STOP SLAVE"
+        repl_binlog_coordinates(true)
+        @repl_paused = true
+      end
     end
     alias stop_replication pause_replication
     
     # Starts replication, or restarts replication after a pause
     def resume_replication
       raise "This DB object has no master" unless master
+      repl_binlog_coordinates(true)
       output "Resuming replication from #{@master}."
       output mysql_root_cmd "START SLAVE"
       @repl_paused = false
     end
     alias start_replication resume_replication
     
-    # Permanently disables replication
+    # Stops replication at the same coordinates on two nodes
+    def pause_replication_with(sibling)
+      [self, sibling].each &:pause_replication
+      
+      # self and sibling at same coordinates: all done
+      return true if repl_binlog_coordinates == sibling.repl_binlog_coordinates
+      
+      # self ahead of sibling: handle via recursion with roles swapped
+      return sibling.pause_replication_with(self) if ahead_of? sibling
+      
+      # sibling ahead of self: catch up to sibling
+      sibling_coords = sibling.repl_binlog_coordinates
+      output "Resuming replication from #{@master} until (#{sibling_coords[0]}, #{sibling_coords[1]})."
+      output(mysql_root_cmd "START SLAVE UNTIL MASTER_LOG_FILE = '#{sibling_coords[0]}', MASTER_LOG_POS = #{sibling_coords[1]}")
+      sleep 1 while repl_binlog_coordinates != sibling_coords
+      true
+    end
+    
+    # Permanently disables replication. Clears out the SHOW SLAVE STATUS output
+    # entirely in MySQL versions that permit this.
     def disable_replication!
-      raise "This DB object has no master" unless master
+      stop_replication
       output "Disabling replication; this db is no longer a slave."
-      output mysql_root_cmd "STOP SLAVE; CHANGE MASTER TO master_host=''; RESET SLAVE"
+      ver = version_tuple
+      
+      # MySQL < 5.5: allows master_host='', which clears out SHOW SLAVE STATUS
+      if ver[0] == 5 && ver[1] < 5
+        output mysql_root_cmd "CHANGE MASTER TO master_host=''; RESET SLAVE"
+      
+      # MySQL 5.5.16+: allows RESET SLAVE ALL, which clears out SHOW SLAVE STATUS
+      elsif ver[0] >= 5 && (ver[0] > 5 || ver[1] >= 5) && (ver[0] > 5 || ver[1] > 5 || ver[2] >= 16)
+        output mysql_root_cmd "CHANGE MASTER TO master_user='test'; RESET SLAVE ALL"
+      
+      # Other versions: no safe way to clear out SHOW SLAVE STATUS.  Still set master_user to 'test'
+      # so that we know to ignore the slave status output.
+      else
+        output mysql_root_cmd "CHANGE MASTER TO master_user='test'; RESET SLAVE"
+      end
+      
       @master.slaves.delete(self) rescue nil
       @master = nil
       @repl_paused = nil
@@ -86,15 +126,18 @@ module Jetpants
       repl_user ||= replication_credentials[:user]
       repl_pass ||= replication_credentials[:pass]
       disable_monitoring
+      targets.each {|t| t.disable_monitoring}
       pause_replication if master && ! @repl_paused
       file, pos = binlog_coordinates
       clone_to!(targets)
-      targets.each do |t| 
+      targets.each do |t|
+        t.enable_monitoring
         t.change_master_to( self, 
                             log_file: file, 
                             log_pos:  pos, 
                             user:     repl_user, 
                             password: repl_pass  )
+        t.enable_read_only!
       end
       resume_replication if @master # should already have happened from the clone_to! restart anyway, but just to be explicit
       enable_monitoring
@@ -107,15 +150,18 @@ module Jetpants
     def enslave_siblings!(targets)
       raise "Can only call enslave_siblings! on a slave instance" unless master
       disable_monitoring
+      targets.each {|t| t.disable_monitoring}
       pause_replication unless @repl_paused
       file, pos = repl_binlog_coordinates
       clone_to!(targets)
       targets.each do |t| 
+        t.enable_monitoring
         t.change_master_to( master, 
                             log_file: file,
                             log_pos:  pos,
                             user:     replication_credentials[:user],
                             password: replication_credentials[:pass]  )
+        t.enable_read_only!
       end
       resume_replication # should already have happened from the clone_to! restart anyway, but just to be explicit
       catch_up_to_master
@@ -223,18 +269,42 @@ module Jetpants
       user && pass ? {user: user, pass: pass} : Jetpants.replication_credentials
     end
     
-    # Disables binary logging in my.cnf.  Does not take effect until you restart
-    # mysql.
+    # This method is no longer supported. It used to manipulate /etc/my.cnf directly, which was too brittle.
+    # You can achieve the same effect by passing parameters to DB#restart_mysql.
     def disable_binary_logging
-      output "Disabling binary logging in MySQL configuration; will take effect at next restart"
-      comment_out_ini(mysql_config_file, 'log-bin', 'log-slave-updates')
+      raise "DB#disable_binary_logging is no longer supported, please use DB#restart_mysql('--skip-log-bin', '--skip-log-slave-updates') instead"
     end
     
-    # Re-enables binary logging in my.cnf after a prior call to disable_bin_log.
-    # Does not take effect until you restart mysql.
+    # This method is no longer supported. It used to manipulate /etc/my.cnf directly, which was too brittle.
+    # You can achieve the same effect by passing (or NOT passing) parameters to DB#restart_mysql.
     def enable_binary_logging
-      output "Re-enabling binary logging in MySQL configuration; will take effect at next restart"
-      uncomment_out_ini(mysql_config_file, 'log-bin', 'log-slave-updates')
+      raise "DB#enable_binary_logging is no longer supported, please use DB#restart_mysql() instead"
+    end
+    
+    # Return true if this node's replication progress is ahead of the provided
+    # node, or false otherwise. The nodes must be in the same pool for coordinates
+    # to be comparable. Does not work in hierarchical replication scenarios!
+    def ahead_of?(node)
+      my_pool = pool(true)
+      raise "Node #{node} is not in the same pool as #{self}" unless node.pool(true) == my_pool
+      
+      my_coords   = (my_pool.master == self ? binlog_coordinates      : repl_binlog_coordinates)
+      node_coords = (my_pool.master == node ? node.binlog_coordinates : node.repl_binlog_coordinates)
+      
+      # Same coordinates
+      if my_coords == node_coords
+        false
+      
+      # Same logfile: simply compare position
+      elsif my_coords[0] == node_coords[0]
+        my_coords[1] > node_coords[1]
+        
+      # Different logfile
+      else
+        my_logfile_num = my_coords[0].match(/^[a-zA-Z.0]+(\d+)$/)[1].to_i
+        node_logfile_num = node_coords[0].match(/^[a-zA-Z.0]+(\d+)$/)[1].to_i
+        my_logfile_num > node_logfile_num
+      end
     end
     
   end

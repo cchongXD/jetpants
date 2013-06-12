@@ -32,10 +32,10 @@ module Jetpants
     #   :exporting      --  Child shard that is exporting its portion of the data set. Shard not in production yet.
     #   :importing      --  Child shard that is importing its portion of the data set. Shard not in production yet.
     #   :replicating    --  Child shard that is being cloned to new replicas. Shard not in production yet.
-    #   :child          --  Child shard that is in production for reads, but still slaving from its parent for writes.
-    #   :needs_cleanup  --  Child shard that is fully in production, but parent replication not torn down yet, and redundant data (from wrong range) not removed yet
-    #   :deprecated     --  Parent shard that has been split but children are still in :child or :needs_cleanup state. Shard may still be in production for writes.
-    #   :recycle        --  Parent shard that has been split and children are now in the :ready state. Shard no longer in production.
+    #   :child          --  In-production shard whose master is slaving from another shard. Reads go to to this shard's master, but writes go to the master of this shard's master and replicate down.
+    #   :needs_cleanup  --  Child shard that is fully in production, but parent replication not torn down yet, and potentially has redundant data (from wrong range) not removed yet
+    #   :deprecated     --  Parent shard that has been split but children are still in :child or :needs_cleanup state. Shard may still be in production for writes / replication not torn down yet.
+    #   :recycle        --  Parent shard that has been split and children are now in the :ready state. Shard no longer in production, replication to children has been torn down.
     attr_accessor :state
     
     # Constructor for Shard --
@@ -44,8 +44,8 @@ module Jetpants
     # * master: string (IP address) or a Jetpants::DB object
     # * state:  one of the above state symbols
     def initialize(min_id, max_id, master, state=:ready)
-      @min_id = min_id
-      @max_id = max_id
+      @min_id = min_id.to_i
+      @max_id = (max_id.to_s.upcase == 'INFINITY' ? 'INFINITY' : max_id.to_i)
       @state = state
 
       @children = []    # array of shards being initialized by splitting this one
@@ -103,7 +103,27 @@ module Jetpants
     def db(mode=:read)
       (mode.to_sym == :write && @parent ? @parent.master : master)
     end
-    
+
+    # Override the probe_tables method to acommodate shard topology -
+    # delegate everything to the first shard.
+    def probe_tables
+      if Jetpants.topology.shards.first == self
+        super
+      else
+        Jetpants.topology.shards.first.probe_tables
+      end
+    end
+
+    # Override the tables accessor to acommodate shard topology - delegate
+    # everything to the first shard
+    def tables
+      if Jetpants.topology.shards.first == self
+        super
+      else
+        Jetpants.topology.shards.first.tables
+      end
+    end
+
     # Adds a Jetpants::Shard to this shard's array of children, and sets
     # the child's parent to be self.
     def add_child(shard)
@@ -120,59 +140,38 @@ module Jetpants
       shard.parent = nil
     end
     
-    # Creates and returns <count> child shards, pulling boxes for masters from spare list.
-    # You can optionally supply the ID ranges to use: pass in an array of arrays,
-    # where the outer array is of size <count> and each inner array is [min_id, max_id].
-    # If you omit id_ranges, the parent's ID range will be divided evenly amongst the
-    # children automatically.
-    def init_children(count, id_ranges=false)
-      # Make sure we have enough machines in spare pool
-      raise "Not enough master role machines in spare pool!" if count > Jetpants.topology.count_spares(role: 'master')
-      raise "Not enough standby_slave role machines in spare pool!" if count * Jetpants.standby_slaves_per_pool > Jetpants.topology.count_spares(role: 'standby_slave')
-      
-      # Make sure enough slaves of shard being split
-      raise "Must have at least #{Jetpants.standby_slaves_per_pool} slaves of shard being split" if master.slaves.count < Jetpants.standby_slaves_per_pool
-      
-      # Make sure right number of id_ranges were supplied, if any were
-      raise "Wrong number of id_ranges supplied" if id_ranges && id_ranges.count != count
-      
-      unless id_ranges
-        id_ranges = []
-        ids_total = 1 + @max_id - @min_id
-        current_min_id = @min_id
-        count.times do |i|
-          ids_this_pool = (ids_total / count).floor
-          ids_this_pool += 1 if i < (ids_total % count)
-          id_ranges << [current_min_id, current_min_id + ids_this_pool - 1]
-          current_min_id += ids_this_pool
-        end
-      end
-      
-      count.times do |i|
-        spare = Jetpants.topology.claim_spare(role: 'master')
-        spare.output "Using ID range of #{id_ranges[i][0]} to #{id_ranges[i][1]} (inclusive)"
-        s = Shard.new(id_ranges[i][0], id_ranges[i][1], spare, :initializing)
-        add_child(s)
-        Jetpants.topology.pools << s
-        s.sync_configuration
-      end
-      
-      @children
-    end
-    
     # Splits a shard into <pieces> child shards.  The children will still be slaving
     # from the parent after this point; you need to do additional things to fully
     # complete the shard split.  See the command suite tasks shard_split_move_reads,
     # shard_split_move_writes, and shard_split_cleanup.
-    def split!(pieces=2)
+    #
+    # You can optionally supply the ID ranges to use: pass in an array of arrays,
+    # where the outer array is of size <pieces> and each inner array is [min_id, max_id].
+    # If you omit id_ranges, the parent's ID range will be divided evenly amongst the
+    # children automatically.
+    def split!(pieces=2, id_ranges=false)
       raise "Cannot split a shard that is still a child!" if @parent
+      raise "Cannot split a shard into #{pieces} pieces!" if pieces < 2
       
-      init_children(pieces) unless @children.count > 0
+      # We can resume partially-failed shard splits if all children made it past
+      # the :initializing stage. (note: some manual cleanup may be required first,
+      # depending on where/how the split failed though.)
+      num_children_post_init = @children.count {|c| c.state != :initializing}
+      if (@children.size > 0 && @children.size != pieces) || (num_children_post_init > 0 && num_children_post_init != pieces)
+        raise "Previous shard split died at an unrecoverable stage, cannot automatically restart"
+      end
       
-      @children.concurrent_each {|c| c.disable_binary_logging}
-      clone_to_children!
-      @children.concurrent_each {|c| c.rebuild!}
-      @children.each {|c| c.sync_configuration}
+      # Set up the child shard masters, unless we're resuming a partially-failed
+      # shard split
+      if num_children_post_init == 0
+        id_ranges ||= even_split_id_range(pieces)
+        init_child_shard_masters(id_ranges)
+      end
+      
+      @children.concurrent_each do |c|
+        c.prune_data! if [:initializing, :exporting, :importing].include? c.state
+        c.clone_slaves_from_master
+      end
       
       @state = :deprecated
       sync_configuration
@@ -190,118 +189,201 @@ module Jetpants
       end
     end
     
-    # Clones the current shard to its children.  Uses a standby slave of self as
-    # the source for copying.
-    def clone_to_children!
-      # Figure out which slave(s) we can use for populating the new masters
-      sources = standby_slaves.dup
-      sources.shift
-      raise "Need to have at least 1 slave in order to create additional slaves" if sources.length < 1
-      
-      # Figure out which machines we need to turn into slaves
-      targets = []
-      @children.each do |child_shard|
-        if child_shard.master.is_slave? && child_shard.master.master != @master
-          raise "Child shard master #{child_shard.master} is already a slave of another pool"
-        elsif child_shard.master.is_slave?
-          child_shard.output "Already slaving from parent shard master"
-          child_shard.restart_mysql # to make previous disable of binary logging take effect
-        else
-          targets << child_shard.master
-        end
-      end
-      
-      while targets.count > 0 do
-        chain_length = (targets.count.to_f / sources.count.to_f).ceil
-        chain_length = 3 if chain_length > 3 # For sanity's sake, we only allow a copy pipeline that populates 3 instances at once.
-        sources.concurrent_each_with_index do |src, idx|
-          my_targets = targets[idx * chain_length, chain_length]
-          src.enslave_siblings! my_targets
-          chain_length.times {|n| targets[(idx * chain_length) + n] = nil}
-        end
-        targets.compact!
-      end
-    end
-    
     # Exports data that should stay on this shard, drops and re-creates tables,
-    # re-imports the data, and then adds slaves to the shard pool as needed.
-    def rebuild!
-      # Sanity check
-      raise "Cannot rebuild a shard that isn't still slaving from another shard" unless @master.is_slave?
-      raise "Cannot rebuild an active shard" if in_config?
+    # and then re-imports the data
+    def prune_data!
+      raise "Cannot prune a shard that isn't still slaving from another shard" unless @master.is_slave?
+      unless [:initializing, :exporting, :importing].include? @state
+        raise "Shard #{self} is not in a state compatible with calling prune_data! (current state=#{@state})"
+      end
       
-      stop_query_killer
       tables = Table.from_config 'sharded_tables'
       
-      if [:initializing, :exporting].include? @state
+      if @state == :initializing
         @state = :exporting
         sync_configuration
+      end
+      
+      if @state == :exporting
+        stop_query_killer
         export_schemata tables
         export_data tables, @min_id, @max_id
-      end
-      
-      if [:exporting, :importing].include? @state
         @state = :importing
         sync_configuration
+      end
+      
+      if @state == :importing
+        stop_query_killer
         import_schemata!
         alter_schemata if respond_to? :alter_schemata
+        disable_monitoring
+        restart_mysql '--skip-log-bin', '--skip-log-slave-updates', '--innodb-autoinc-lock-mode=2', '--skip-slave-start'
         import_data tables, @min_id, @max_id
+        restart_mysql # to clear out previous options '--skip-log-bin', '--skip-log-slave-updates', '--innodb-autoinc-lock-mode=2'
+        enable_monitoring
         start_query_killer
       end
-      
-      if [:importing, :replicating].include? @state
-        enable_binary_logging
-        restart_mysql
-        @state = :replicating
-        sync_configuration
-        my_slaves = Jetpants.topology.claim_spares(Jetpants.standby_slaves_per_pool, role: 'standby_slave')
-        enslave!(my_slaves)
-        my_slaves.each {|slv| slv.resume_replication}
-        [self, my_slaves].flatten.each {|db| db.catch_up_to_master}
-      else
-        raise "Shard not in a state compatible with calling rebuild! (current state=#{@state})"
-      end
-      
-      @state = :child
     end
     
-    # Run this on a parent shard after the rest of a shard split is complete.
-    # Sets this shard's master to read-only; removes the application user from
-    # self (without replicating this change to children); disables replication
-    # between the parent and the children; and then removes rows from the 
-    # children that replicated to the wrong shard.
+    # Creates standby slaves for a shard by cloning the master.
+    # Only call this on a child shard that isn't in production yet, or on
+    # a production shard that's been marked as offline.
+    def clone_slaves_from_master
+      # If shard is already in state :child, it may already have slaves
+      slaves_needed = Jetpants.standby_slaves_per_pool
+      slaves_needed -= standby_slaves.size if @state == :child
+      if slaves_needed < 1
+        output "Shard already has enough standby slaves, skipping step of cloning more"
+        return
+      end
+      
+      slaves_available = Jetpants.topology.count_spares(role: :standby_slave, like: master)
+      raise "Not enough standby_slave role machines in spare pool!" if slaves_needed > slaves_available
+      
+      # Handle state transitions
+      if @state == :child || @state == :importing
+        @state = :replicating
+        sync_configuration
+      elsif @state == :offline || @state == :replicating
+        # intentional no-op, no need to change state
+      else
+        raise "Shard #{self} is not in a state compatible with calling clone_slaves_from_master! (current state=#{@state})"
+      end
+      
+      my_slaves = Jetpants.topology.claim_spares(slaves_needed, role: :standby_slave, like: master)
+      enslave!(my_slaves)
+      my_slaves.each &:resume_replication
+      [self, my_slaves].flatten.each {|db| db.catch_up_to_master}
+      
+      # Update state, if relevant
+      if @state == :replicating
+        @state = :child
+        sync_configuration
+      end
+      @children
+    end
+    
+    # Cleans up the state of a shard. This has two use-cases:
+    # A. Run this on a parent shard after the rest of a shard split is complete.
+    #    Sets this shard's master to read-only; removes the application user from
+    #    self (without replicating this change to children); disables replication
+    #    between the parent and the children; and then removes rows from the 
+    #    children that replicated to the wrong shard.
+    # B. Run this on a shard that just underwent a two-step promotion process which
+    #    moved all reads, and then all writes, to a slave that has slaves of its own.
+    #    For example, if upgrading MySQL on a shard by creating a newer-version slave
+    #    and then adding slaves of its own to it (temp hierarchical replication setup).
+    #    You can use this method to then "eject" the older-version master and its
+    #    older-version slaves from the pool.
     def cleanup!
-      raise "Can only run cleanup! on a parent shard in the deprecated state" unless @state == :deprecated
       raise "Cannot call cleanup! on a child shard" if @parent
+
+      # situation A - clean up after a shard split
+      if @state == :deprecated && @children.size > 0
+        tables = Table.from_config 'sharded_tables'
+        @master.revoke_all_access!
+        @children.concurrent_each do |child_shard|
+          raise "Child state does not indicate cleanup is needed" unless child_shard.state == :needs_cleanup
+          raise "Child shard master should be a slave in order to clean up" unless child_shard.is_slave?
+          child_shard.master.disable_replication! # stop slaving from parent
+          child_shard.prune_data_to_range tables, child_shard.min_id, child_shard.max_id
+        end
       
-      tables = Table.from_config 'sharded_tables'
-      @master.revoke_all_access!
-      @children.concurrent_each do |child_shard|
-        raise "Child state does not indicate cleanup is needed" unless child_shard.state == :needs_cleanup
-        raise "Child shard master should be a slave in order to clean up" unless child_shard.is_slave?
-        child_shard.master.disable_replication! # stop slaving from parent
-        child_shard.prune_data_to_range tables, child_shard.min_id, child_shard.max_id
+        # We have to iterate over a copy of the @children array, rather than the array
+        # directly, since Array#each skips elements when you remove elements in-place,
+        # which Shard#remove_child does...
+        @children.dup.each do |child_shard|
+          child_shard.state = :ready
+          remove_child child_shard
+          child_shard.sync_configuration
+        end
+        @state = :recycle
+      
+      # situation B - clean up after a two-step shard master promotion
+      elsif @state == :needs_cleanup && @master.master && !@parent
+        eject_master = @master.master
+        eject_slaves = @master.slaves.reject {|s| s == @master}
+        eject_master.revoke_all_access!
+        @master.disable_replication!
+        
+        # We need to update the asset tracker to no longer consider the ejected
+        # nodes as part of this pool. This includes ejecting the old master, which
+        # might be handled by Pool#after_master_promotion! instead 
+        # of Shard#sync_configuration.
+        after_master_promotion!(@master, false) if respond_to? :after_master_promotion!
+        
+        @state = :ready
+        
+      else
+        raise "Shard #{self} is not in a state compatible with calling cleanup! (state=#{state}, child count=#{@children.size}"
       end
       
-      # We have to iterate over a copy of the @children array, rather than the array
-      # directly, since Array#each skips elements when you remove elements in-place,
-      # which Shard#remove_child does...
-      @children.dup.each do |child_shard|
-        child_shard.state = :ready
-        remove_child child_shard
-        child_shard.sync_configuration
-      end
-      @state = :recycle
       sync_configuration
     end
     
     # Displays information about the shard
-    def summary(extended_info=false, with_children=true)
+    def summary(extended_info=false, with_children=false)
       super(extended_info)
       if with_children
         children.each {|c| c.summary}
       end
       true
+    end
+    
+    
+    ###### Private methods #####################################################
+    private
+    
+    # Splits self's ID range into num_children pieces
+    # Returns an array of [low_id, high_id] arrays, suitable for
+    # passing to Shard#init_child_shard_masters
+    def even_split_id_range(num_children)
+      raise "Cannot calculate an even split of last shard" if @max_id == 'INFINITY'
+      id_ranges = []
+      ids_total = 1 + @max_id - @min_id
+      current_min_id = @min_id
+      num_children.times do |i|
+        ids_this_pool = (ids_total / num_children).floor
+        ids_this_pool += 1 if i < (ids_total % num_children)
+        id_ranges << [current_min_id, current_min_id + ids_this_pool - 1]
+        current_min_id += ids_this_pool
+      end
+      id_ranges
+    end
+    
+    # Early step of shard split process: initialize child shard pools, pull boxes from
+    # spare list to use as masters for these new shards, and then populate them with the
+    # full data set from self (the shard being split).
+    #
+    # Supply an array of [min_id, max_id] arrays, specifying the ID ranges to use for each
+    # child. For example, if self has @min_id = 1001 and @max_id = 4000, and you're splitting
+    # into 3 evenly-sized child shards, you'd supply [[1001,2000], [2001,3000], [3001, 4000]]
+    def init_child_shard_masters(id_ranges)
+      # Validations: make sure enough machines in spare pool; enough slaves of shard being split;
+      # no existing children of shard being split
+      # TODO: fix the first check to separately account for :role, ie check master and standby_slave counts separately
+      # (this is actually quite difficult since we can't provide a :like node in a sane way)
+      spares_needed = id_ranges.size * (1 + Jetpants.standby_slaves_per_pool)
+      raise "Not enough machines in spare pool!" if spares_needed > Jetpants.topology.count_spares(role: :master, like: master)
+      raise 'Shard split functionality requires Jetpants config setting "standby_slaves_per_pool" is at least 1' if Jetpants.standby_slaves_per_pool < 1
+      raise "Must have at least #{Jetpants.standby_slaves_per_pool} slaves of shard being split" if master.slaves.size < Jetpants.standby_slaves_per_pool
+      raise "Shard #{self} already has #{@children.size} child shards" if @children.size > 0
+      
+      # Set up the child shards, and give them masters
+      id_ranges.each do |my_range|
+        spare = Jetpants.topology.claim_spare(role: :master, like: master)
+        spare.disable_read_only! if (spare.running? && spare.read_only?)
+        spare.output "Will be master for new shard with ID range of #{my_range.first} to #{my_range.last} (inclusive)"
+        s = Shard.new(my_range.first, my_range.last, spare, :initializing)
+        add_child(s)
+        Jetpants.topology.pools << s
+        s.sync_configuration
+      end
+      
+      # We'll clone the full parent data set from a standby slave of the shard being split
+      source = standby_slaves.first
+      targets = @children.map &:master
+      source.enslave_siblings! targets
     end
     
   end

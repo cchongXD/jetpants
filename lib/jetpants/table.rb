@@ -41,20 +41,86 @@ module Jetpants
     # the default of 1 (meaning no chunking). For tables with hundreds of millions
     # of rows, you may want to do exports/imports in a few hundred chunks to speed
     # things up and keep the transactions smaller.
-    attr_reader :chunks
+    attr_accessor :chunks
     
-    # Create a Table. Params should have string keys, not symbols. Possible keys include
-    # 'sharding_key' (or equivalently 'primary_key'), 'chunks', and 'order_by'.
+    # The SQL statement read from the DB via SHOW CREATE TABLE
+    attr_reader :create_table_sql
+
+    # The primary key of the table, returns an array on a multi-
+    # column PK
+    attr_reader :primary_key
+
+    # A list of indexes mapped to the columns in them
+    attr_reader :indexes
+
+    # A list of the table column names
+    attr_reader :columns 
+
+    # Pool object this Table is related to
+    attr_reader :pool
+
+    # Create a Table. Possible keys include 'sharding_key', 'chunks', 'order_by',
+    # 'create_table', 'pool', 'indexes', and anything else handled by plugins
     def initialize(name, params={})
       @name = name
-      params['sharding_key'] ||= params['primary_keys'] || params['primary_key'] || 'user_id'
-      @sharding_keys = (params['sharding_key'].is_a?(Array) ? params['sharding_key'] : [params['sharding_key']])
+      parse_params(params)
+    end
+
+    def parse_params(params = {})
+      # Convert symbols to strings
+      params.keys.select {|k| k.is_a? Symbol}.each do |symbol_key|
+        params[symbol_key.to_s] = params[symbol_key]
+        params.delete symbol_key
+      end
+      
+      # accept singular or plural for some params
+      params['sharding_key'] ||= params['sharding_keys']
+      params['primary_key']  ||= params['primary_keys']
+      
+      @sharding_keys = (params['sharding_key'].is_a?(Array) ? params['sharding_key'] : [params['sharding_key']]) if params['sharding_key']
+      @sharding_keys ||= []
+      
+      @primary_key = params['primary_key']
       @chunks = params['chunks'] || 1
       @order_by = params['order_by']
+      @create_table_sql = params['create_table'] || params['create_table_sql']
+      @pool = params['pool']
+      @indexes = params['indexes']
+      @columns = params['columns'] 
     end
     
+    # Returns the current maximum primary key value, returns
+    # the values of the record when ordered by the key fields
+    # in order, descending on a multi-value PK
+    def max_pk_val_query
+      if @primary_key.is_a?(Array)
+        pk_str = @primary_key.join(",")
+        pk_ordering = @primary_key.map{|key| "#{key} DESC"}.join(',')
+        sql = "SELECT #{pk_str} FROM #{@name} ORDER BY #{pk_ordering} LIMIT 1"
+      else
+        sql = "SELECT MAX(#{@primary_key}) FROM #{@name}"
+      end
+      return sql
+    end
+    
+    # Returns the first column of the primary key, or nil if there isn't one
+    def first_pk_col
+      if @primary_key.is_a? Array
+        @primary_key.first
+      else
+        @primary_key
+      end
+    end
+    
+    # Returns true if the table is associated with the supplied pool
+    def belongs_to?(pool)
+      return @pool == pool
+    end
+
     # Return an array of Table objects based on the contents of Jetpants' config file entry
     # of the given label.
+    # TODO: integrate better with table schema detection code. Consider auto-detecting chunk
+    # count based on file size and row count estimate.
     def Table.from_config(label)
       result = []
       Jetpants.send(label).map {|name, attributes| Table.new name, attributes}
@@ -123,13 +189,21 @@ module Jetpants
       return sql
     end
     
-    # Counts number of rows between the given ID ranges.  Warning: will give
-    # potentially misleading counts on multi-sharding-key tables.
+    # Returns SQL to counts number of rows between the given ID ranges.
+    # Warning: will give potentially misleading counts on multi-sharding-key tables.
     def sql_count_rows(min_id, max_id)
-      sql = "SELECT COUNT(*) FROM #{@name} WHERE "
+      sql = "SELECT COUNT(*) FROM #{@name}"
+      return sql unless min_id && max_id
+      
       wheres = []
-      @sharding_keys.each {|col| wheres << "(#{col} >= #{min_id} AND #{col} <= #{max_id})"}
-      sql << wheres.join(" OR ")
+      
+      if @sharding_keys.size > 0
+        @sharding_keys.each {|col| wheres << "(#{col} >= #{min_id} AND #{col} <= #{max_id})"}
+        sql << ' WHERE ' + wheres.join(" OR ")
+      elsif first_pk_col
+        sql << " WHERE #{first_pk_col} >= #{min_id} AND #{first_pk_col} <= #{max_id}"
+      end
+      sql
     end
     
     # Returns a file path (as a String) for the export dumpfile of the given ID range.

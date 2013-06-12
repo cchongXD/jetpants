@@ -56,6 +56,7 @@ module Jetpants
       @master = master.to_db
       @master_read_weight = 0
       @active_slave_weights = {}
+      @tables = nil
     end
     
     # Returns all slaves, or pass in :active, :standby, or :backup to receive slaves
@@ -96,7 +97,47 @@ module Jetpants
     def nodes
       [master, slaves].flatten.compact
     end
+
+    # Look at a database in the pool (preferably a standby slave, but will check
+    # active slave or master if nothing else is available) and retrieve a list of
+    # tables, detecting their schema
+    def probe_tables
+      master.probe
+      db = standby_slaves.last || active_slaves.last || master
+      if db && db.running?
+        output "Probing tables via #{db}"
+      else
+        output "Warning: unable to probe tables"
+        return
+      end
+      
+      @tables = []
+      sql = "SHOW TABLES"
+      db.query_return_array(sql).each do |tbl|
+        table_name = tbl.values.first
+        @tables << db.detect_table_schema(table_name)
+      end
+    end
     
+    # Returns a list of table objects for this pool
+    def tables
+      self.probe_tables unless @tables
+      @tables
+    end
+
+    # Queries whether a pool has a table with a given name
+    # note that this is the string name of the table and not an object
+    def has_table?(table)
+      tables.map(&:to_s).include?(table)
+    end
+
+    # Retrieve the table object for a given table name
+    def get_table(table)
+      raise "Pool #{self} does not have table #{table}" unless has_table? table
+
+      @tables.select{|tb| tb.to_s == table}.first
+    end
+
     # Informs Jetpants that slave_db is an active slave. Potentially used by 
     # plugins, such as in Topology at start-up time.
     def has_active_slave(slave_db, weight=100)
@@ -125,17 +166,23 @@ module Jetpants
     
     # Remove a slave from a pool entirely. This is destructive, ie, it does a
     # RESET SLAVE on the db.
+    #
     # Note that a plugin may want to override this (or implement after_remove_slave!)
     # to actually sync the change to an asset tracker, depending on how the plugin
     # implements Pool#sync_configuration. (If the implementation makes sync_configuration
-    # work by iterating over the pool's current slaves, it won't see any slaves that have
-    # been removed.)
+    # work by iterating over the pool's current slaves to update their status/role/pool, it 
+    # won't see any slaves that have been removed, and therefore won't update them.)
+    #
+    # This method has no effect on slaves that are unavailable via SSH or have MySQL
+    # stopped, because these are only considered to be in the pool if your asset tracker
+    # plugin intentionally adds them. Such plugins could also handle this in the
+    # after_remove_slave! callback.
     def remove_slave!(slave_db)
       raise "Slave is not in this pool" unless slave_db.pool == self
+      return false unless (slave_db.running? && slave_db.available?)
       slave_db.disable_monitoring
-      slave_db.stop_replication
-      slave_db.repl_binlog_coordinates # displays how far we replicated, in case you need to roll back this change manually
       slave_db.disable_replication!
+      sync_configuration # may or may not be sufficient -- see note above.
     end
     
     # Informs this pool that it has an alias. A pool may have any number of aliases.
@@ -157,7 +204,8 @@ module Jetpants
 
       alias_text = @aliases.count > 0 ? '  (aliases: ' + @aliases.join(', ') + ')' : ''
       data_size = @master.running? ? "[#{master.data_set_size(true)}GB]" : ''
-      print "#{name}#{alias_text}  #{data_size}\n"
+      state_text = (respond_to?(:state) && state != :ready ? "  (state: #{state})" : '')
+      print "#{name}#{alias_text}#{state_text}  #{data_size}\n"
       
       if extended_info
         details = {}
@@ -167,27 +215,31 @@ module Jetpants
           elsif s == @master
             details[s] = {coordinates: s.binlog_coordinates(false), lag: 'N/A'}
           else
-            details[s] = {coordinates: s.repl_binlog_coordinates(false), lag: s.seconds_behind_master.to_s + 's'}
+            lag = s.seconds_behind_master
+            lag_str = lag.nil? ? 'NULL' : lag.to_s + 's'
+            details[s] = {coordinates: s.repl_binlog_coordinates(false), lag: lag_str}
           end
         end
       end
       
       binlog_pos = extended_info ? details[@master][:coordinates].join(':') : ''
-      print "\tmaster          = %-13s %-30s %s\n" % [@master.ip, @master.hostname, binlog_pos]
+      print "\tmaster          = %-15s %-32s %s\n" % [@master.ip, @master.hostname, binlog_pos]
       
       [:active, :standby, :backup].each do |type|
         slave_list = slaves(type)
         slave_list.sort.each_with_index do |s, i|
           binlog_pos = extended_info ? details[s][:coordinates].join(':') : ''
           slave_lag = extended_info ? "lag=#{details[s][:lag]}" : ''
-          print "\t%-7s slave #{i + 1} = %-13s %-30s %-26s %s\n" % [type, s.ip, s.hostname, binlog_pos, slave_lag]
+          print "\t%-7s slave #{i + 1} = %-15s %-32s %-26s %s\n" % [type, s.ip, s.hostname, binlog_pos, slave_lag]
         end
       end
       true
     end
     
     # Demotes the pool's existing master, promoting a slave in its place.
-    def master_promotion!(promoted)
+    # The old master will become a slave of the new master if enslave_old_master is true,
+    # unless the old master is unavailable/crashed.
+    def master_promotion!(promoted, enslave_old_master=true)
       demoted = @master
       raise "Demoted node is already the master of this pool!" if demoted == promoted
       raise "Promoted host is not in the right pool!" unless demoted.slaves.include?(promoted)
@@ -197,7 +249,7 @@ module Jetpants
       # If demoted machine is available, confirm it is read-only and binlog isn't moving,
       # and then wait for slaves to catch up to this position
       if demoted.running?
-        demoted.enable_read_only! unless demoted.read_only?
+        demoted.enable_read_only!
         raise "Unable to enable global read-only mode on demoted machine" unless demoted.read_only?
         coordinates = demoted.binlog_coordinates
         raise "Demoted machine still taking writes (from superuser or replication?) despite being read-only" unless coordinates == demoted.binlog_coordinates
@@ -237,7 +289,7 @@ module Jetpants
       
       # gather our new replicas
       replicas.delete promoted
-      replicas << demoted if demoted.running?
+      replicas << demoted if demoted.running? && enslave_old_master
       
       # perform promotion
       replicas.each do |r|

@@ -37,10 +37,12 @@ module Jetpants
       puts "Regenerated #{config_file_path}"
     end
     
+    # simple_tracker completely ignores any options like :role or :like
     def claim_spares(count, options={})
       raise "Not enough spare machines -- requested #{count}, only have #{@tracker.spares.count}" if @tracker.spares.count < count
       hashes = @tracker.spares.shift(count)
-      hashes.map {|h| h['node'] ? h['node'].to_db : h.to_db}
+      update_tracker_data
+      hashes.map {|h| h.is_a?(Hash) && h['node'] ? h['node'].to_db : h.to_db}
     end
     
     def count_spares(options={})
@@ -57,7 +59,7 @@ module Jetpants
     # only.
     def update_tracker_data
       @tracker.global_pools = functional_partitions.map &:to_hash
-      @tracker.shards = shards.map &:to_hash
+      @tracker.shards = shards.reject {|s| s.state == :recycle}.map &:to_hash
       @tracker.save
     end
     

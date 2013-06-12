@@ -41,14 +41,19 @@ module Jetpants
     # Initializes (or re-initializes) the connection pool upon first use or upon
     # requesting a different user or schema. Note that we only maintain one connection
     # pool per DB.
-    # Valid options include :user, :pass, :schema, :max_conns or omit these to use
-    # defaults.
+    # Valid options include :user, :pass, :schema, :max_conns, :after_connect or omit
+    # these to use defaults.
     def connect(options={})
+      if @options.include? '--skip-networking'
+        output 'Skipping connection attempt because server started with --skip-networking'
+        return nil
+      end
+      
       options[:user]    ||= app_credentials[:user]
       options[:schema]  ||= app_schema
       
       return @db if @db && @user == options[:user] && @schema == options[:schema]
-
+      
       disconnect if @db
       
       @db = Sequel.connect(
@@ -58,9 +63,11 @@ module Jetpants
         :user             =>  options[:user],
         :password         =>  options[:pass] || app_credentials[:pass],
         :database         =>  options[:schema],
-        :max_connections  =>  options[:max_conns] || Jetpants.max_concurrency)
+        :max_connections  =>  options[:max_conns] || Jetpants.max_concurrency,
+        :after_connect    =>  options[:after_connect] )
       @user = options[:user]
       @schema = options[:schema]
+      @db.convert_tinyint_to_bool = false
       @db
     end
     
