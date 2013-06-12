@@ -9,28 +9,44 @@ module Jetpants
     # OK to use this if MySQL is already stopped; it's a no-op then.
     def stop_mysql
       output "Attempting to shutdown MySQL"
+      disconnect if @db
       output service(:stop, 'mysql')
-      running = ssh_cmd "netstat -ln | grep #{@port} | wc -l"
+      running = ssh_cmd "netstat -ln | grep ':#{@port}' | wc -l"
       raise "[#{@ip}] Failed to shut down MySQL: Something is still listening on port #{@port}" unless running.chomp == '0'
+      @options = []
       @running = false
     end
     
     # Starts MySQL, and confirms that something is now listening on the port.
     # Raises an exception if MySQL is already running or if something else is
     # already running on its port.
-    def start_mysql
-      @repl_paused = false if @master
-      running = ssh_cmd "netstat -ln | grep #{@port} | wc -l"
+    # Options should be supplied as positional method args, for example:
+    #   start_mysql '--skip-networking', '--skip-grant-tables'
+    def start_mysql(*options)
+      if @master
+        @repl_paused = options.include?('--skip-slave-start')
+      end
+      running = ssh_cmd "netstat -ln | grep ':#{@port}' | wc -l"
       raise "[#{@ip}] Failed to start MySQL: Something is already listening on port #{@port}" unless running.chomp == '0'
-      output "Attempting to start MySQL"
-      output service(:start, 'mysql')
+      if options.size == 0
+        output "Attempting to start MySQL, no option overrides supplied"
+      else
+        output "Attempting to start MySQL with options #{options.join(' ')}"
+      end
+      output service(:start, 'mysql', options.join(' '))
+      @options = options
       confirm_listening
       @running = true
+      if role == :master && ! @options.include?('--skip-networking')
+        disable_read_only!
+      end
     end
     
     # Restarts MySQL.
-    def restart_mysql
-      @repl_paused = false if @master
+    def restart_mysql(*options)
+      if @master
+        @repl_paused = options.include?('--skip-slave-start')
+      end
       
       # Disconnect if we were previously connected
       user, schema = false, false
@@ -39,13 +55,21 @@ module Jetpants
         disconnect
       end
       
-      output "Attempting to restart MySQL"
-      output service(:restart, 'mysql')
+      if options.size == 0
+        output "Attempting to restart MySQL, no option overrides supplied"
+      else
+        output "Attempting to restart MySQL with options #{options.join(' ')}"
+      end
+      output service(:restart, 'mysql', options.join(' '))
+      @options = options
       confirm_listening
       @running = true
-      
-      # Reconnect if we were previously connected
-      connect(user: user, schema: schema) if user || schema
+      unless @options.include?('--skip-networking')
+        disable_read_only! if role == :master
+        
+        # Reconnect if we were previously connected
+        connect(user: user, schema: schema) if user || schema
+      end
     end
     
     # Has no built-in effect. Plugins can override it, and/or implement
@@ -60,20 +84,18 @@ module Jetpants
     
     # Confirms that a process is listening on the DB's port
     def confirm_listening(timeout=10)
-      confirm_listening_on_port(@port, timeout)
+      if @options.include? '--skip-networking'
+        output 'Unable to confirm mysqld listening because server started with --skip-networking'
+        false
+      else
+        confirm_listening_on_port(@port, timeout)
+      end
     end
     
     # Returns the MySQL data directory for this instance. A plugin can override this
     # if needed, especially if running multiple MySQL instances on the same host.
     def mysql_directory
       '/var/lib/mysql'
-    end
-    
-    # Returns the MySQL server configuration file for this instance. A plugin can
-    # override this if needed, especially if running multiple MySQL instances on
-    # the same host.
-    def mysql_config_file
-      '/etc/my.cnf'
     end
     
     # Has no built-in effect. Plugins can override it, and/or implement

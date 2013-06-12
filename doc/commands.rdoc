@@ -12,9 +12,11 @@ Here's a more thorough description of the commands, grouped by function:
 
 \Jetpants copies data sets by shutting down the MySQL daemon on the source node and then copying all MySQL files. This is the fastest way to clone MySQL data sets, and is part of the reason why we recommend having 2 standby slaves per pool for high availability.
 
-The copy method in \Jetpants uses a combination of tar, netcat (nc), and pigz. It does not use encryption; we assume you are transferring over a secure local network.  When copying to multiple destinations, \Jetpants creates a "copy chain" using tee and a fifo. For more information on this technique, please see {our post on the Tumblr engineering blog}[http://engineering.tumblr.com/post/7658008285/efficiently-copying-files-to-multiple-destinations].
+The copy method in \Jetpants uses a combination of tar, netcat (nc), and whichever compression binary you have specified in your Jetpants configuration file (if any). It does not use encryption; we assume you are transferring over a secure local network.  When copying to multiple destinations, \Jetpants creates a "copy chain" using tee and a fifo. For more information on this technique, please see {our post on the Tumblr engineering blog}[http://engineering.tumblr.com/post/7658008285/efficiently-copying-files-to-multiple-destinations].
 
-This command does not require an asset tracker plugin, but DOES require that all your database nodes have pigz (a parallel gzip tool) installed. This may become configurable in a future release.
+This command does not require an asset tracker plugin, but DOES require that all your database nodes have installed whichever compression binary you specified in the Jetpants config file.
+
+If you are using an asset tracker, when prompted for which nodes to clone TO, you may type "spare" (or equivalently just hit ENTER without typing any input) to claim a spare node with role STANDBY_SLAVE. You may clone to multiple spares at once by supplying comma-separated input like "spare, spare, spare". You can mix-and-match with supplying IP addresses of particular hosts as well.
 
 
 == Master/slave state changes
@@ -73,7 +75,7 @@ Or if you're deploying a brand new pool in an existing topology:
 5. Stop replicating writes from the parent shard, and then take the parent pool offline entirely.
 6. Remove rows that replicated to the wrong child shard. This data will be sparse, since it's only the writes that were made since the shard split process started.
 
-For more information, including diagrams of each step, please see {our presentation at Velocity Europe 2011}[https://github.com/tumblr/jetpants/blob/master/doc/VelocityEurope2011Presentation.pdf?raw=true].
+For more information, including diagrams of each step, please see {our presentation at Percona Live  2013}[https://github.com/tumblr/jetpants/blob/master/doc/PerconaLive2013Presentation.pdf?raw=true].
 
 Separately, \Jetpants also allows you to alter the range of the last shard in your topology. In a range-based sharding scheme, the last shard has a range of X to infinity; eventually this will be too large of a range, so you need to truncate that shard range and create a "new" last shard after it.  We call this process "shard cutover".
 
@@ -103,18 +105,18 @@ With an asset tracker, \Jetpants allows you to mark a shard as read-only or comp
 
 == Informational commands
 
-These commands do not require an asset tracker. They may be fleshed out further in a future release of \Jetpants.
+These commands display status information about a particular node, pool, or the entire topology.
 
-<b><tt>jetpants node_info</tt></b> displays information on a MySQL instance.
+<b><tt>jetpants summary</tt></b> displays information about a node, along with its pool. Does not require an asset tracker.
 
-<b><tt>jetpants show_master</tt></b> tells you what node is the master of a given MySQL instance.
+<b><tt>jetpants pools</tt></b> displays full information about all pools (name, size, full node list including roles), and then displays counts of all nodes by role. Requires an asset tracker to obtain the list of all pools. This command may take a minute or two to run (depending on topology size) since it has to probe every node to determine roles.
 
-<b><tt>jetpants show_slaves</tt></b> displays a list of slaves (along with current slave lag) of a MySQL instance.
+<b><tt>jetpants pools_compact</tt></b> displays condensed information about all pools (name, master IP, size). Requires an asset tracker to obtain the list of all pools.
 
 
 == Miscellaneous
 
-<b><tt>jetpants rebuild_slave</tt></b> exports all data on a standby slave, drops tables, recreates tables, and then re-imports the data. This is useful for defragmenting a node. Currently it only works on shard pool slaves; this may change in a future release.
+<b><tt>jetpants defrag_slave</tt></b> exports all data on a standby slave, drops tables, recreates tables, and then re-imports the data. This is useful for defragmenting a node. Currently it only works on shard pool slaves; this may change in a future release.
 
 <b><tt>jetpants regen_config</tt></b> regenerates your application's configuration file, assuming you are using an asset tracker. This isn't terribly useful in most cases, because any commands that make configuration changes will do this automatically. However, you may want to run this after manually making topology changes via <tt>jetpants console</tt>.
 

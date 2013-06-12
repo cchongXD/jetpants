@@ -8,6 +8,16 @@ module Jetpants
       sync_configuration
     end
     
+    def after_cleanup!
+      output 'This shard has now been fully split.'
+      nodes.each do |n|
+        n.output 'This node is no longer in use; please recycle or cancel it.'
+      end
+      puts 'If recycling nodes, be sure to completely clean them: wipe binlogs and all'
+      puts 'MySQL data, and put clean data files with proper grants in place, before'
+      puts 'you put the nodes back on the spare list.'
+    end
+    
     
     ##### NEW CLASS-LEVEL METHODS ##############################################
     
@@ -52,7 +62,7 @@ module Jetpants
         # read-only shards, and offline shards appropriately.
         return me.merge case state
                  when :ready, :needs_cleanup then {'host' => master.ip}
-                 when :child then {'host_read' => master.ip, 'host_write' => parent.master.ip}
+                 when :child then {'host_read' => master.ip, 'host_write' => master.master.ip}
                  when :read_only then {'host_read' => master.ip, 'host_write' => false}
                  when :offline then {'host' => false}
                  end

@@ -106,6 +106,36 @@ module Jetpants
       global_status[:Connections].to_i - conn_counter > threshold
     end
 
+    # Gets the max theads connected over a time period
+    def max_threads_running(tries=8, interval=1.0)
+      poll_status_value(:Threads_running,:max, tries, interval)
+    end
+
+    # Gets the max or avg for a mysql value
+    def poll_status_value(field, type=:max, tries=8, interval=1.0)
+      max = 0
+      sum = 0
+      tries.times do
+        value = global_status[field].to_i
+        max = value unless max > value
+        sum += value
+        sleep(interval)
+      end
+      if type == :max
+        max
+      elsif type == :avg
+        sum.to_f/tries.to_f
+      end
+    end
+    
+    # Confirms the binlog of this node has not moved during a duration
+    # of [interval] seconds.
+    def taking_writes?(interval=5.0)
+      coords = binlog_coordinates
+      sleep(interval)
+      coords != binlog_coordinates
+    end
+    
     # Returns true if this instance appears to be a standby slave,
     # false otherwise. Note that "standby" in this case is based
     # on whether the slave is actively receiving connections, not
@@ -126,6 +156,27 @@ module Jetpants
       @host.hostname.start_with? 'backup'
     end
     
+    # Returns true if the node can be promoted to be the master of its pool,
+    # false otherwise (also false if node is ALREADY the master)
+    # Don't use this in hierarchical replication scenarios, result may be
+    # unexpected.
+    def promotable_to_master?(detect_version_mismatches=true)
+      # backup_slaves are non-promotable
+      return false if for_backups?
+      
+      # already the master
+      p = pool(true)
+      return false if p.master == self
+      
+      # ordinarily, cannot promote a slave that's running a higher version of
+      # MySQL than any other node in the pool.
+      if detect_version_mismatches
+        p.nodes.all? {|db| db == self || !db.available? || db.version_cmp(self) >= 0}
+      else
+        true
+      end
+    end
+    
     # Returns a hash mapping global MySQL variables (as symbols)
     # to their values (as strings).
     def global_variables
@@ -143,12 +194,55 @@ module Jetpants
         variables      
       end
     end
-
+    
+    # Returns an array of integers representing the version of the MySQL server.
+    # For example, Percona Server 5.5.27-rel28.1-log would return [5, 5, 27]
+    def version_tuple
+      result = nil
+      if running?
+        # If the server is running, we can just query it
+        result = global_variables[:version].split('.', 3).map(&:to_i) rescue nil
+      end
+      if result.nil?
+        # Otherwise we need to parse the output of mysqld --version
+        output = ssh_cmd 'mysqld --version'
+        matches = output.downcase.match('ver\s*(\d+)\.(\d+)\.(\d+)')
+        raise "Unable to determine version for #{self}" unless matches
+        result = matches[1, 3].map(&:to_i)
+      end
+      result
+    end
+    
+    # Return a string representing the version. The precision indicates how
+    # many major/minor version numbers to return.
+    # ie, on 5.5.29, normalized_version(3) returns '5.5.29',
+    # normalized_version(2) returns '5.5', and normalized_version(1) returns '5'
+    def normalized_version(precision=2)
+      raise "Invalid precision #{precision}" if precision < 1 || precision > 3
+      version_tuple[0, precision].join('.')
+    end
+    
+    # Returns -1 if self is running a lower version than db; 1 if self is running
+    # a higher version; and 0 if running same version.
+    def version_cmp(db, precision=2)
+      raise "Invalid precision #{precision}" if precision < 1 || precision > 3
+      my_tuple = version_tuple[0, precision]
+      other_tuple = db.version_tuple[0, precision]
+      my_tuple.each_with_index do |subver, i|
+        return -1 if subver < other_tuple[i]
+        return 1 if subver > other_tuple[i]
+      end
+      0
+    end
+    
     # Returns the Jetpants::Pool that this instance belongs to, if any.
     # Can optionally create an anonymous pool if no pool was found. This anonymous
     # pool intentionally has a blank sync_configuration implementation.
     def pool(create_if_missing=false)
-      result = Jetpants.topology.pool(self) || Jetpants.topology.pool(master)
+      result = Jetpants.topology.pool(self)
+      if !result && master
+        result ||= Jetpants.topology.pool(master)
+      end
       if !result && create_if_missing
         pool_master = master || self
         result = Pool.new('anon_pool_' + pool_master.ip.tr('.', ''), pool_master)
@@ -163,10 +257,15 @@ module Jetpants
     # Note that we consider a node with no master and no slaves to be
     # a :master, since we can't determine if it had slaves but they're
     # just offline/dead, vs it being an orphaned machine.
+    #
+    # In hierarchical replication scenarios (such as the child shard
+    # masters in the middle of a shard split), we return :master if
+    # Jetpants.topology considers the node to be the master for a pool.
     def role
       p = pool
       case
-      when !@master then :master
+      when !@master then :master                                # nodes that aren't slaves (including orphans) 
+      when p.master == self then :master                        # nodes that the topology thinks are masters
       when for_backups? then :backup_slave
       when p && p.active_slave_weights[self] then :active_slave # if pool in topology, determine based on expected/ideal state
       when !p && !is_standby? then :active_slave                # if pool missing from topology, determine based on actual state
@@ -174,15 +273,36 @@ module Jetpants
       end
     end
     
+    # Returns the data set size in bytes (if in_gb is false or omitted) or in gigabytes
+    # (if in_gb is true).  Note that this is actually in gibibytes (2^30) rather than
+    # a metric gigabyte.  This puts it on the same scale as the output to tools like 
+    # "du -h" and "df -h".
+    def data_set_size(in_gb=false)
+      bytes = dir_size("#{mysql_directory}/#{app_schema}") + dir_size("#{mysql_directory}/ibdata1")
+      in_gb ? (bytes / 1073741824.0).round : bytes
+    end
+    
+    def mount_stats(mount=false)
+      mount ||= mysql_directory
+
+      host.mount_stats(mount)
+    end
+    
     ###### Private methods #####################################################
     
     private
     
-    # Check if mysqld is running
+    # Check if mysqld is running.
+    # If your Linux distro's implementation of "service" returns output formatted
+    # differently than what we check for here (which matches RHEL and Ubuntu),
+    # you will need to override this method in a plugin! Or if you submit a patch
+    # we'd be happy to merge it upstream to support more distros.
     def probe_running
       if @host.available?
-        status = service(:status, 'mysql')
-        @running = !(status.downcase.include?('not running'))
+        status = service(:status, 'mysql').downcase
+        # mysql is running if the output of "service mysql status" doesn't include any of these strings
+        not_running_strings = ['not running', 'stop/waiting']
+        @running = not_running_strings.none? {|str| status.include? str}
       else
         @running = false
       end
@@ -199,9 +319,11 @@ module Jetpants
       else
         @master = self.class.new(status[:master_host], status[:master_port])
         if status[:slave_io_running] != status[:slave_sql_running]
-          message = "One replication thread is stopped and the other is not"
-          raise "#{self}: #{message}" if Jetpants.verify_replication
-          output message
+          output "One replication thread is stopped and the other is not."
+          if Jetpants.verify_replication
+            output "You must repair this node manually, OR remove it from its pool permanently if it is unrecoverable."
+            raise "Fatal replication problem on #{self}"
+          end
           pause_replication
         else
           @repl_paused = (status[:slave_io_running].downcase == 'no')
@@ -219,15 +341,24 @@ module Jetpants
     #
     # Plugins may want to override DB#probe_slaves itself too, if running multiple
     # MySQL instances per physical machine. In this case you'll want to use 
-    # SHOW SLAVE HOSTS, and all slaves must be using the --report-host option.
+    # SHOW SLAVE HOSTS, and all slaves must be using the --report-host option if
+    # using MySQL < 5.5.3.
     def probe_slaves
       return unless @running # leaves @slaves as nil to indicate unknown state
       @slaves = []
       slaves_mutex = Mutex.new
       processes = mysql_root_cmd("SHOW PROCESSLIST", :terminator => ';').split("\n")
-      processes.grep(/Binlog Dump/).concurrent_each do |p|
+      
+      # We have to de-dupe the output, since it's possible in weird edge cases for
+      # the same slave to be listed twice
+      ips = {}
+      processes.grep(/Binlog Dump/).each do |p|
         tokens = p.split
         ip, dummy = tokens[2].split ':'
+        ips[ip] = true
+      end
+      
+      ips.keys.concurrent_each do |ip|
         db = ip.to_db
         db.probe
         slaves_mutex.synchronize {@slaves << db if db.master == self}

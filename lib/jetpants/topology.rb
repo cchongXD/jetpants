@@ -71,22 +71,36 @@ module Jetpants
     synchronized
     # Plugin should override so that this returns an array of [count] Jetpants::DB
     # objects, or throws an exception if not enough left.
-    # Options hash is plugin-specific. The only assumed option used by the rest of
-    # Jetpants is :role of 'MASTER' or 'STANDBY_SLAVE', for grabbing hardware
-    # suited for a particular purpose. This can be ignored if your hardware is
-    # entirely uniform and/or a burn-in process is already performed on all new
-    # hardware intakes.
+    #
+    # Options hash is plugin-specific. Jetpants core will provide these two options,
+    # but it's up to a plugin to handle (or ignore) them:
+    #
+    # :role   =>  :master or :standby_slave, indicating what purpose the new node(s)
+    #             will be used for. Useful if your hardware spec varies by node role
+    #             (not recommended!) or if you vet your master candidates more carefully.
+    # :like   =>  a Jetpants::DB object, indicating that the spare node hardware spec
+    #             should be like the specified DB's spec.
     def claim_spares(count, options={})
       raise "Plugin must override Topology#claim_spares"
     end
     
     synchronized
     # Plugin should override so that this returns a count of spare machines
-    # matching the selected options.
+    # matching the selected options. options hash follows same format as for
+    # Topology#claim_spares.
     def count_spares(options={})
       raise "Plugin must override Topology#count_spares"
     end
     
+    # Returns a list of valid role symbols in use in Jetpants.
+    def valid_roles
+      [:master, :active_slave, :standby_slave, :backup_slave]
+    end
+    
+    # Returns a list of valid role symbols which indicate a slave status
+    def slave_roles
+      valid_roles.reject {|r| r == :master}
+    end
     
     ###### Instance Methods ####################################################
     
@@ -100,12 +114,13 @@ module Jetpants
       @pools.reject {|p| p.is_a? Shard}
     end
     
-    # Finds and returns a single Jetpants::Pool. Target may be a name (string) or master (DB object).
+    # Finds and returns a single Jetpants::Pool. Target may be a name (string, case insensitive)
+    # or master (DB object).
     def pool(target)
       if target.is_a?(DB)
         @pools.select {|p| p.master == target}.first
       else
-        @pools.select {|p| p.name == target}.first
+        @pools.select {|p| p.name.downcase == target.downcase}.first
       end
     end
     
@@ -128,8 +143,21 @@ module Jetpants
     end
     
     # Returns the Jetpants::Shard that handles the given ID.
+    # During a shard split, if the child isn't "in production" yet (ie, it's
+    # still being built), this will always return the parent shard. Once the
+    # child is fully built / in production, this method will always return
+    # the child shard. However, Shard#db(:write) will correctly delegate writes
+    # to the parent shard when appropriate in this case. (see also: Topology#shard_db_for_id)
     def shard_for_id(id)
-      @shards.select {|s| s.min_id <= id && (s.max_id == 'INFINITY' || s.max_id >= id)}[0]
+      choices = shards.select {|s| s.min_id <= id && (s.max_id == 'INFINITY' || s.max_id >= id)}
+      choices.reject! {|s| s.parent && ! s.in_config?} # filter out child shards that are still being built
+      
+      # Preferentially return child shards at this point
+      if choices.any? {|s| s.parent}
+        choices.select {|s| s.parent}.first
+      else
+        choices.first
+      end
     end
     
     # Returns the Jetpants::DB that handles the given ID with the specified
@@ -142,6 +170,19 @@ module Jetpants
     # a single Jetpants::DB object instead of an array.
     def claim_spare(options={})
       claim_spares(1, options)[0]
+    end
+    
+    # Returns if the supplied role is valid
+    def valid_role? role
+      valid_roles.include? role.to_s.downcase.to_sym
+    end
+    
+    # Converts the supplied roles (strings or symbols) into lowercase symbol versions
+    # Will expand out special role of :slave to be all slave roles.
+    def normalize_roles(*roles)
+      roles = roles.flatten.map {|r| r.to_s.downcase == 'slave' ? slave_roles.map(&:to_s) : r.to_s.downcase}.flatten
+      roles.each {|r| raise "#{r} is not a valid role" unless valid_role? r}
+      roles.uniq.map &:to_sym
     end
     
     synchronized

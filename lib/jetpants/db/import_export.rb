@@ -101,14 +101,29 @@ module Jetpants
     # run after export_data (in the same process), import_data will 
     # automatically confirm that the import counts match the previous export
     # counts.
+    #
     # Creates a 'jetpants' db user with FILE permissions for the duration of the
     # import.
+    #
+    # Note: import will be substantially faster if you disable binary logging
+    # before the import, and re-enable it after the import. You also must set
+    # InnoDB's autoinc lock mode to 2 in order to do a chunked import with
+    # auto-increment tables.  You can achieve all this by calling
+    # DB#restart_mysql '--skip-log-bin', '--skip-log-slave-updates', '--innodb-autoinc-lock-mode=2'
+    # prior to importing data, and then clear those settings by calling
+    # DB#restart_mysql with no params after done importing data.
     def import_data(tables, min_id=false, max_id=false)
+      disable_read_only!
       import_export_user = 'jetpants'
       create_user(import_export_user)
       grant_privileges(import_export_user)               # standard privs
       grant_privileges(import_export_user, '*', 'FILE')  # FILE global privs
-      reconnect(user: import_export_user)
+      
+      # Disable unique checks upon connecting. This has to be done at the :after_connect level in Sequel
+      # to guarantee it's being run on every connection in the conn pool. This is mysql2-specific.
+      disable_unique_checks_proc = Proc.new {|mysql2_client| mysql2_client.query 'SET unique_checks = 0'}
+      
+      reconnect(user: import_export_user, after_connect: disable_unique_checks_proc)
       
       import_counts = {}
       tables.each {|t| import_counts[t.name] = import_table_data t, min_id, max_id}
@@ -177,13 +192,18 @@ module Jetpants
     # MUCH faster than doing a single count, but far more I/O intensive, so
     # don't use this on a master or active slave.
     def row_counts(tables, min_id, max_id)
+      tables = [tables] unless tables.is_a? Array
       lock = Mutex.new
       row_count = {}
       tables.each do |t|
         row_count[t.name] = 0
-        (min_id..max_id).in_chunks(t.chunks, 10) do |min, max|
-          result = query_return_first_value(t.sql_count_rows(min, max))
-          lock.synchronize {row_count[t.name] += result}
+        if min_id && max_id && t.chunks > 1
+          (min_id..max_id).in_chunks(t.chunks, Jetpants.max_concurrency) do |min, max|
+            result = query_return_first_value(t.sql_count_rows(min, max))
+            lock.synchronize {row_count[t.name] += result}
+          end
+        else
+          row_count[t.name] = query_return_first_value(t.sql_count_rows(false, false))
         end
         output "#{row_count[t.name]} rows counted", t
       end
@@ -231,6 +251,10 @@ module Jetpants
           id = query_return_first_value(finder_sql)
           break unless id
           rows_deleted += query(deleter_sql, id)
+          
+          # Slow down on multi-col sharding key tables, due to queries being far more expensive
+          sleep(0.0001) if table.sharding_keys.size > 1
+          
           iter += 1
           output("#{dir_english} deletion progress: through #{col} #{id}, deleted #{rows_deleted} rows so far", table) if iter % 50000 == 0
         end
@@ -258,9 +282,7 @@ module Jetpants
       
       disable_monitoring
       stop_query_killer
-      disable_binary_logging
-      restart_mysql
-      pause_replication if is_slave?
+      restart_mysql '--skip-log-bin', '--skip-log-slave-updates', '--innodb-autoinc-lock-mode=2', '--skip-slave-start'
       
       # Automatically detect missing min/max. Assumes that all tables' primary keys
       # are on the same scale, so this may be non-ideal, but better than just erroring.
@@ -283,22 +305,11 @@ module Jetpants
       import_schemata!
       alter_schemata if respond_to? :alter_schemata
       import_data tables, min_id, max_id
-
-      resume_replication if is_slave?
-      enable_binary_logging
+      
       restart_mysql
-      catch_up_to_master
+      catch_up_to_master if is_slave?
       start_query_killer
       enable_monitoring
-    end
-    
-    # Returns the data set size in bytes (if in_gb is false or omitted) or in gigabytes
-    # (if in_gb is true).  Note that this is actually in gibibytes (2^30) rather than
-    # a metric gigabyte.  This puts it on the same scale as the output to tools like 
-    # "du -h" and "df -h".
-    def data_set_size(in_gb=false)
-      bytes = dir_size("#{mysql_directory}/#{app_schema}")
-      in_gb ? (bytes / 1073741824.0).round : bytes
     end
     
     # Copies mysql db files from self to one or more additional DBs.
@@ -312,15 +323,21 @@ module Jetpants
       destinations = {}
       targets.each do |t| 
         destinations[t] = t.mysql_directory
-        existing_size = t.data_set_size + t.dir_size("#{t.mysql_directory}/ibdata1")
-        raise "Over 100 MB of existing MySQL data on target #{t}, aborting copy!" if existing_size > 100000000
+        raise "Over 100 MB of existing MySQL data on target #{t}, aborting copy!" if t.data_set_size > 100000000
       end
       [self, targets].flatten.concurrent_each {|t| t.stop_query_killer; t.stop_mysql}
       targets.concurrent_each {|t| t.ssh_cmd "rm -rf #{t.mysql_directory}/ib_logfile*"}
+      
+      # Construct the list of files and dirs to copy. We include ib_lru_dump if present
+      # (ie, if using Percona Server with innodb_buffer_pool_restore_at_startup enabled)
+      # since this will greatly improve warm-up time of the cloned nodes
+      files = ['ibdata1', 'mysql', 'test', app_schema]
+      files << 'ib_lru_dump' if ssh_cmd("test -f #{mysql_directory}/ib_lru_dump 2>/dev/null; echo $?").chomp.to_i == 0
+      
       fast_copy_chain(mysql_directory, 
                       destinations,
                       port: 3306,
-                      files: ['ibdata1', 'mysql', 'test', app_schema],
+                      files: files,
                       overwrite: true)
       [self, targets].flatten.concurrent_each {|t| t.start_mysql; t.start_query_killer}
     end

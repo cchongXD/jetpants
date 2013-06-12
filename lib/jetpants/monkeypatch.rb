@@ -1,5 +1,14 @@
 # This file contains any methods we're adding to core Ruby modules
 
+# Add a deep_merge method to Hash in order to more effectively join configs
+class Hash
+  def deep_merge!(other_hash)
+    merge!(other_hash) do |key, oldval, newval|
+      (oldval.class == self.class && newval.class == oldval.class) ? oldval.deep_merge!(newval) : newval
+    end
+  end
+end
+
 # Reopen Enumerable to add some concurrent iterators
 module Enumerable
   # Works like each but runs the block in a separate thread per item.
@@ -16,6 +25,32 @@ module Enumerable
   # Works like each_with_index but runs the block in a separate thread per item.
   def concurrent_each_with_index(&block)
     each_with_index.concurrent_each(&block)
+  end
+  
+  # Alternative for concurrent_map which also has the ability to limit how
+  # many threads are used. Much less elegant :(
+  def limited_concurrent_map(thread_limit=40)
+    lock = Mutex.new
+    group = ThreadGroup.new
+    items = to_a
+    results = []
+    pos = 0
+    
+    # Number of concurrent threads is the lowest of: self length, supplied thread limit, global concurrency limit
+    [items.length, thread_limit, Jetpants.max_concurrency].min.times do
+      th = Thread.new do
+        while true do
+          my_pos = nil
+          lock.synchronize { my_pos = pos; pos += 1}
+          break unless my_pos < items.length
+          my_result = yield items[my_pos]
+          lock.synchronize { results[my_pos] = my_result }
+        end
+      end
+      group.add th
+    end
+    group.list.each {|th| th.join}
+    results
   end
 end
 
